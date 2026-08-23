@@ -1,4 +1,4 @@
-;;; claude-buffer.el --- Claude Code CLI を普通のバッファでチャットする -*- lexical-binding: t; -*-
+;;; claude-buffer.el --- Chat with the Claude Code CLI in a plain Emacs buffer -*- lexical-binding: t; -*-
 
 ;; Author: hanyazou@gmail.com>
 ;; URL: https://github.com/hanyazou/claude-buffer
@@ -7,38 +7,40 @@
 ;; Keywords: tools, convenience
 
 ;;; Commentary:
-;; vterm 越しにTUIを操作するのではなく、`claude -p --input-format stream-json
-;; --output-format stream-json' をパイプで起動し、標準入出力のJSONLだけで
-;; やり取りする。バッファは普通のEmacsバッファなので、移動・検索・コピペは
-;; 全部いつも通り。
+;; Instead of driving the TUI through vterm, this pipes `claude -p
+;; --input-format stream-json --output-format stream-json' and talks to it
+;; purely through JSONL on stdin/stdout. The buffer is a plain Emacs buffer,
+;; so navigation, search, and copy/paste all work as usual.
 ;;
-;; コマンド (claude-custom.el の -new/-new-here/-resume/-resume-here と同じ考え方):
-;;   claude-buffer-new      : フォルダに依存しない新規チャット(デフォルト misc)
-;;   claude-buffer-new-here : カレントのプロジェクトルートで新規チャット
-;;   claude-buffer-resume   : 全プロジェクト横断でセッション一覧から選んで再開
-;;   claude-buffer-resume-here : カレントプロジェクトのセッションから選んで再開
-;;   claude-buffer-remove-session      : 全プロジェクト横断でセッションを選んで削除
-;;   claude-buffer-remove-session-here : カレントプロジェクトのセッションから選んで削除
-;;   claude-buffer-rename-session      : 全プロジェクト横断でセッションを選んで改名
-;;   claude-buffer-rename-session-here : カレントプロジェクトのセッションから選んで改名
-;;   claude-buffer          : カレントディレクトリのまま新規チャット(素の版)
+;; Commands (same idea as -new/-new-here/-resume/-resume-here in claude-custom.el):
+;;   claude-buffer-new      : folder-independent new chat (defaults to misc)
+;;   claude-buffer-new-here : new chat rooted at the current project root
+;;   claude-buffer-resume   : pick a session to resume across all projects
+;;   claude-buffer-resume-here : pick a session to resume within the current project
+;;   claude-buffer-remove-session      : pick a session to delete across all projects
+;;   claude-buffer-remove-session-here : pick a session to delete within the current project
+;;   claude-buffer-rename-session      : pick a session to rename across all projects
+;;   claude-buffer-rename-session-here : pick a session to rename within the current project
+;;   claude-buffer          : new chat in the current directory (plain version)
 ;;
-;; resume系は completing-read を使うので、RETで直近セッションを再開、
-;; SPC/TABで補完・一覧表示ができる。再開時は過去ログをuser>/claude>形式で
-;; バッファ先頭に再現する。
+;; The resume commands use completing-read, so RET resumes the most recent
+;; session, and SPC/TAB complete/list candidates. Resuming replays the past
+;; log at the top of the buffer in user>/claude> form.
 ;;
-;; キー操作:
-;;   C-c C-c  : マーカー以降(入力中のテキスト)をまとめて送信
-;;   RET      : 改行(複数行の入力を組み立てる用。C-j / S-RET も同様)
+;; Key bindings:
+;;   C-c C-c  : send everything after the marker (the text being typed) as one message
+;;   RET      : newline (for composing multi-line input; C-j / S-RET do the same)
 ;;
-;; Shift+EnterとEnterを打ち分けて送信/改行を切り替える設計は採用していない。
-;; Apple Terminal.appやTera Termをはじめ多くのターミナルエミュレータは
-;; Shift+Enterを素のEnterと区別して送ってこないため(GUI Emacsや一部の
-;; 対応端末を除く)、環境によらず確実に効くC-c C-cを送信キーにしている。
+;; There is no Shift+Enter-vs-Enter distinction for send/newline. Most
+;; terminal emulators, including Apple Terminal.app and Tera Term, don't
+;; report Shift+Enter differently from plain Enter (except GUI Emacs and a
+;; few capable terminals), so C-c C-c is used for send since it works
+;; reliably regardless of environment.
 ;;
-;; 権限は試作用に固定: /tmp相当のファイル作成・変更、bash実行(コンパイル・
-;; 実行含む)、Web検索を allowedTools で許可し、それ以外は都度は聞かず
-;; acceptEdits で進める。
+;; Permissions are fixed for prototyping: allowedTools grants file
+;; creation/editing (roughly /tmp-equivalent), bash execution (including
+;; compiling/running), and web search, and everything else proceeds under
+;; acceptEdits without asking each time.
 
 ;;; Code:
 
@@ -54,51 +56,54 @@
     "--verbose"
     "--permission-mode" "acceptEdits"
     "--allowedTools" "Write Edit Bash WebSearch")
-  "claude プロセスを起動するコマンドと引数.")
+  "Command and arguments used to launch the claude process.")
 
 (defvar-local claude-buffer--process nil
-  "このバッファに紐づく claude プロセス.")
+  "The claude process associated with this buffer.")
 
 (defvar-local claude-buffer--session-id nil
-  "このバッファが繋がっているセッションID.
-resume時は最初から分かっているので即座にセットされ、新規チャットの場合は
-system/init イベント(あるいは他のどのイベントにも載っている session_id)を
-受け取った時点でセットされる. resume時に、同じセッションに既に生きている
-バッファがないか探すために使う.")
+  "The session ID this buffer is connected to.
+Known upfront and set immediately when resuming; for a new chat it gets
+set once the system/init event (or the session_id carried on any other
+event) arrives. Used when resuming to check whether a buffer is already
+alive for the same session.")
 
 (defvar-local claude-buffer--input-marker nil
-  "これより前が確定済みの履歴、これより後が入力中のテキスト.")
+  "Everything before this is committed history; everything after is the
+text currently being typed.")
 
 (defvar-local claude-buffer--claude-output-marker nil
-  "今のターンでclaudeの出力(Thinking...含む)を挿入していく位置.")
+  "Position where claude's output for the current turn (including
+Thinking...) is inserted.")
 
 (defvar-local claude-buffer--awaiting-first-text nil
-  "非nilなら、次のテキストが来たらThinking...を置き換える.")
+  "When non-nil, the next text received will replace Thinking....")
 
 (defvar-local claude-buffer--pending-tool-output nil
-  "非nilなら、直前の出力がtool_use/tool_resultだったことを示す.
-次にテキストブロックが来た時、区切りとして\"claude> \"を先に出すために使う.")
+  "Non-nil means the previous output was a tool_use/tool_result.
+Used so that the next text block is preceded by a \"claude> \" separator.")
 
 (defvar-local claude-buffer--pending-output ""
-  "JSONLの行区切りが来るまでの断片を溜めておくバッファ.")
+  "Buffer that accumulates fragments until a JSONL line break arrives.")
 
 (defvar-local claude-buffer--turn-timer nil
-  "ターン中の経過秒数をmode-lineに表示し続けるタイマー.")
+  "Timer that keeps showing elapsed seconds for the current turn in the
+mode-line.")
 
 (defvar-local claude-buffer--turn-start-time nil
-  "現在のターンを送信した時刻(float-time). ターン中のみ非nil.")
+  "Time (float-time) the current turn was sent. Non-nil only during a turn.")
 
 (defconst claude-buffer--thinking-text "Thinking..."
-  "送信直後に表示しておく仮の応答テキスト.")
+  "Placeholder response text shown right after sending.")
 
 (defconst claude-buffer--separator "\n-----\n"
-  "user>/claude> プロンプトの前に挿入する区切り.")
+  "Separator inserted before the user>/claude> prompts.")
 
 (defun claude-buffer--append-output (text)
-  "TEXT をclaudeの出力として追加する.
-このターンで最初のテキストならThinking...を置き換え、
-2回目以降ならそのまま継ぎ足す.
-ユーザーのポイント位置(入力中/過去ログ閲覧中)は動かさない."
+  "Append TEXT as claude's output.
+Replaces Thinking... if this is the first text of the turn, otherwise
+just appends it. Does not move the user's point (whether typing or
+browsing history)."
   (save-excursion
     (let ((start (marker-position claude-buffer--claude-output-marker)))
       (when claude-buffer--awaiting-first-text
@@ -109,14 +114,15 @@ system/init イベント(あるいは他のどのイベントにも載ってい�
       (set-marker claude-buffer--claude-output-marker (point)))))
 
 (defun claude-buffer--finish-if-no-text ()
-  "このターンで一度もテキストが来なかった場合、Thinking...を消す."
+  "Clear Thinking... if no text arrived at all during this turn."
   (when (and claude-buffer--awaiting-first-text claude-buffer--claude-output-marker)
-    (claude-buffer--append-output "(出力なし)")))
+    (claude-buffer--append-output "(no output)")))
 
 (defun claude-buffer--tick-elapsed (buf)
-  "BUF のmode-lineに、ターン開始からの経過秒数を反映する.
-権限待ちやBashの長時間実行などJSONLの更新が全く来ない間でも、
-プロセス(とEmacs側)が生きていて時間が進んでいることが見えるようにする."
+  "Reflect the elapsed seconds since the turn started in BUF's mode-line.
+Makes it visible that the process (and Emacs) is alive and time is
+passing even while waiting on a permission prompt or a long-running Bash
+command, during which no JSONL updates arrive at all."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (when claude-buffer--turn-start-time
@@ -125,15 +131,15 @@ system/init イベント(あるいは他のどのイベントにも載ってい�
         (force-mode-line-update)))))
 
 (defun claude-buffer--start-turn-timer ()
-  "ターン送信時に呼ぶ. claude-buffer--tick-elapsed を1秒ごとに走らせる."
+  "Call when a turn is sent. Runs claude-buffer--tick-elapsed once a second."
   (claude-buffer--stop-turn-timer)
   (setq claude-buffer--turn-start-time (float-time))
   (setq claude-buffer--turn-timer
         (run-with-timer 1 1 #'claude-buffer--tick-elapsed (current-buffer))))
 
 (defun claude-buffer--stop-turn-timer ()
-  "ターン終了(結果受信/プロセス終了/バッファkill)時に呼ぶ.
-タイマーを止め、mode-lineの経過秒数表示を消す."
+  "Call when a turn ends (result received / process exited / buffer killed).
+Stops the timer and clears the elapsed-seconds display in the mode-line."
   (when claude-buffer--turn-timer
     (cancel-timer claude-buffer--turn-timer)
     (setq claude-buffer--turn-timer nil))
@@ -142,23 +148,26 @@ system/init イベント(あるいは他のどのイベントにも載ってい�
   (force-mode-line-update))
 
 (defconst claude-buffer--tool-detail-maxlen 200
-  "tool_use の要約に使うパラメータ文字列の最大長.")
+  "Max length of the parameter string used in the tool_use summary.")
 
 (defconst claude-buffer--tool-result-max-lines 10
-  "tool_result を表示する際の最大行数(末尾からこの行数だけ表示).")
+  "Max number of lines shown for a tool_result (only this many lines from
+the tail are shown).")
 
 (defun claude-buffer--truncate-detail (s maxlen)
-  "S をMAXLEN文字までに切り詰める. 改行はそのまま残す(複数行コマンドを
-1行に潰して読みにくくしないため。バッファ名用の
-claude-buffer--sanitize-label とは違い、改行を空白に置換しない)."
+  "Truncate S to MAXLEN characters. Newlines are kept as-is (so a
+multi-line command isn't squashed into an unreadable single line; unlike
+claude-buffer--sanitize-label, which is for buffer names, newlines are
+not replaced with spaces)."
   (let ((s (string-trim (or s ""))))
     (if (> (length s) maxlen)
         (concat (substring s 0 maxlen) "…")
       s)))
 
 (defun claude-buffer--tool-use-summary (block)
-  "BLOCK (assistantのtool_useブロック)から「ツール名: 詳細」の行を作る.
-詳細は command/file_path/pattern/url/query/prompt のうち最初に見つかったもの."
+  "Build a \"tool name: detail\" line from BLOCK (an assistant tool_use
+block). The detail is whichever of command/file_path/pattern/url/query/
+prompt is found first."
   (let* ((name (or (alist-get 'name block) "?"))
          (input (alist-get 'input block))
          (detail (or (alist-get 'command input)
@@ -173,8 +182,8 @@ claude-buffer--sanitize-label とは違い、改行を空白に置換しない).
             (claude-buffer--truncate-detail (or detail "") claude-buffer--tool-detail-maxlen))))
 
 (defun claude-buffer--tool-result-text (block)
-  "BLOCK (userのtool_resultブロック)の content を文字列として取り出す.
-content は文字列の場合と、textブロックの配列の場合がある."
+  "Extract the content of BLOCK (a user tool_result block) as a string.
+content may be either a string or an array of text blocks."
   (let ((content (alist-get 'content block)))
     (cond
      ((stringp content) content)
@@ -183,9 +192,10 @@ content は文字列の場合と、textブロックの配列の場合がある."
      (t ""))))
 
 (defun claude-buffer--tool-result-summary (block)
-  "BLOCK (tool_resultブロック)の結果を、末尾
-claude-buffer--tool-result-max-lines 行だけ整形して返す.
-is_errorがtなら行頭に✗を付け、それ以外は半角スペース4つのインデントにする."
+  "Format the result of BLOCK (a tool_result block), keeping only the
+last claude-buffer--tool-result-max-lines lines.
+Prefixes each line with ✗ when is_error is t, otherwise with a 4-space
+indent."
   (let* ((is-error (eq (alist-get 'is_error block) t))
          (text (string-trim (claude-buffer--tool-result-text block)))
          (lines (unless (string-empty-p text) (split-string text "\n")))
@@ -194,36 +204,40 @@ is_errorがtなら行頭に✗を付け、それ以外は半角スペース4つ�
          (prefix (if is-error "✗ " "    ")))
     (concat
      (when (> total claude-buffer--tool-result-max-lines)
-       (format "%s(%d行省略)\n" prefix (- total claude-buffer--tool-result-max-lines)))
+       (format "%s(%d lines omitted)\n" prefix (- total claude-buffer--tool-result-max-lines)))
      (mapconcat (lambda (l) (format "%s%s\n" prefix l)) tail ""))))
 
 (defun claude-buffer--result-summary (data)
-  "DATA (resultイベント)から所要時間・コスト・ターン数の1行サマリーを作る."
+  "Build a one-line summary of duration, cost, and turn count from DATA
+(a result event)."
   (let ((seconds (/ (or (alist-get 'duration_ms data) 0) 1000.0))
         (cost (or (alist-get 'total_cost_usd data) 0))
         (turns (or (alist-get 'num_turns data) 0))
         (err (eq (alist-get 'is_error data) t)))
-    (format "[%s: %.1f秒 / $%.4f / %dターン]\n"
-            (if err "エラー" "完了") seconds cost turns)))
+    (format "[%s: %.1fs / $%.4f / %d turns]\n"
+            (if err "Error" "Done") seconds cost turns)))
 
 (defun claude-buffer--append-text (text)
-  "TEXT (assistantのtextブロック)をバッファに追加する.
-直前の出力がtool_use/tool_resultだった場合は、区切りとして
-先に\"claude> \"を出す(ツールの実行ログと本文を視覚的に分けるため)."
+  "Append TEXT (an assistant text block) to the buffer.
+If the previous output was a tool_use/tool_result, first emit a
+\"claude> \" separator (to visually set the answer apart from the tool
+execution log)."
   (when claude-buffer--pending-tool-output
     (claude-buffer--append-output (concat "\n" (propertize "claude> " 'face 'bold)))
     (setq claude-buffer--pending-tool-output nil))
   (claude-buffer--append-output text))
 
 (defun claude-buffer--append-tool-output (text)
-  "TEXT (tool_use/tool_resultの要約)をバッファに追加し、
-直後にtextブロックが来た時に区切りを出せるようフラグを立てる."
+  "Append TEXT (a tool_use/tool_result summary) to the buffer and set a
+flag so a separator can be emitted if a text block follows immediately
+after."
   (claude-buffer--append-output text)
   (setq claude-buffer--pending-tool-output t))
 
 (defun claude-buffer--handle-json-line (line)
-  "LINE (JSONL一行)をパースして、表示すべき部分をバッファに追加する.
-assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリーを扱う."
+  "Parse LINE (one JSONL line) and append the parts worth displaying to
+the buffer. Handles assistant text/tool_use, user tool_result,
+permission denials, and the result summary."
   (condition-case err
       (let* ((json-object-type 'alist)
              (json-array-type 'list)
@@ -248,7 +262,7 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
               (claude-buffer--append-tool-output (claude-buffer--tool-result-summary block)))))
          ((and (equal type "system") (equal (alist-get 'subtype data) "permission_denied"))
           (claude-buffer--append-output
-           (format "[権限拒否: %s — %s]\n"
+           (format "[Permission denied: %s — %s]\n"
                    (or (alist-get 'tool_name data) "?")
                    (or (alist-get 'decision_reason data) (alist-get 'message data) "?"))))
          ((equal type "result")
@@ -256,10 +270,11 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
           (claude-buffer--stop-turn-timer)
           (claude-buffer--append-output (concat "\n" (claude-buffer--result-summary data))))))
     (error
-     (message "claude-buffer: JSON行のパースに失敗: %s" (error-message-string err)))))
+     (message "claude-buffer: failed to parse JSON line: %s" (error-message-string err)))))
 
 (defun claude-buffer--filter (proc chunk)
-  "プロセスフィルタ. CHUNK を溜めて改行ごとにJSON行として処理する."
+  "Process filter. Accumulates CHUNK and processes it as JSON lines split
+on newlines."
   (let ((buf (process-buffer proc)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -274,7 +289,7 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
               (claude-buffer--handle-json-line line))))))))
 
 (defun claude-buffer--sentinel (proc event)
-  "プロセス終了などを知らせるセンチネル."
+  "Sentinel that reports process termination and similar events."
   (let ((buf (process-buffer proc)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -286,14 +301,15 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
           (insert (format "[claude process %s]\n" (string-trim event))))))))
 
 (defun claude-buffer--send ()
-  "マーカー以降を1メッセージとしてclaudeへ送信し、
-claude> Thinking... と次の user> プロンプトを表示する.
-C-c C-c にキーバインドするだけの関数なのでM-xには出さない(interactive無し)."
+  "Send everything after the marker to claude as one message, and display
+claude> Thinking... followed by the next user> prompt.
+Only meant to be bound to C-c C-c, so it's left without interactive to
+keep it out of M-x."
   (let ((text (string-trim
                (buffer-substring-no-properties
                 claude-buffer--input-marker (point-max)))))
     (if (string-empty-p text)
-        (message "claude-buffer: 送信する入力がありません")
+        (message "claude-buffer: nothing to send")
       (goto-char (point-max))
       (insert claude-buffer--separator)
       (insert (propertize "claude> " 'face 'bold))
@@ -315,41 +331,46 @@ C-c C-c にキーバインドするだけの関数なのでM-xには出さない
 
 (defvar claude-buffer-mode-map
   (let ((map (make-sparse-keymap)))
-    ;; claude-buffer--send は名前付きのinteractiveコマンドにせず、
-    ;; ここで無名lambdaとしてバインドすることでM-x補完に出てこないようにする.
-    ;; RETは特にrebindしない(バッファ標準の改行のまま).
+    ;; claude-buffer--send is bound here as an anonymous lambda instead of a
+    ;; named interactive command so it doesn't show up in M-x completion.
+    ;; RET is deliberately left unbound (the buffer's default newline behavior).
     (define-key map (kbd "C-c C-c") (lambda () (interactive) (claude-buffer--send)))
     map)
-  "claude-buffer-mode 用のキーマップ.
-送信は C-c C-c で行う. Shift+Enterでの送信/改行切り替えは、多くの
-ターミナルエミュレータがShift+Enterを素のEnterと区別できないため
-採用していない(詳細はファイル冒頭のCommentary参照).")
+  "Keymap for claude-buffer-mode.
+Send with C-c C-c. Switching send/newline based on Shift+Enter isn't used
+because most terminal emulators can't distinguish Shift+Enter from plain
+Enter (see the Commentary at the top of the file for details).")
 
 (define-derived-mode claude-buffer-mode fundamental-mode "Claude"
-  "claude -p --input-format/--output-format stream-json と会話する為の
-プレーンなEmacsバッファ. TUIを経由しないので、移動・検索・コピペは
-普通のバッファ操作がそのまま使える."
+  "A plain Emacs buffer for talking to claude -p
+--input-format/--output-format stream-json. Since it doesn't go through a
+TUI, ordinary buffer operations — navigation, search, copy/paste — all
+just work."
   :interactive nil)
 
 (defun claude-buffer--dir-label (dir)
-  "DIR (パス)の表示用ラベル(末尾のディレクトリ名)を返す."
+  "Return a display label for DIR (a path): its trailing directory name."
   (file-name-nondirectory (directory-file-name (expand-file-name dir))))
 
 (defun claude-buffer--sanitize-label (s maxlen)
-  "S をバッファ名に使える形に整形する(改行・*を除去し、MAXLEN文字に切り詰め)."
+  "Sanitize S for use in a buffer name (strip newlines/*, truncate to
+MAXLEN characters)."
   (let ((s (string-trim (replace-regexp-in-string "[\n\r*]" " " (or s "")))))
     (if (> (length s) maxlen)
         (concat (substring s 0 maxlen) "…")
       s)))
 
 (defun claude-buffer--start (&optional resume-id history-file summary)
-  "新しいclaudeチャットバッファとプロセスを開始する.
-RESUME-ID が非nilなら `--resume RESUME-ID' を付けて再開する.
-HISTORY-FILE が非nilなら、そのセッションの過去ログをバッファ先頭に再現する.
-SUMMARY はそのセッションの最初の発言など、名前に使う内容ベースのラベル.
-プロセスのカレントディレクトリは呼び出し時の `default-directory' を使う.
-バッファ名は new なら *claude:フォルダ名*、resume なら
-*claude:フォルダ名:内容ラベル* (取れなければセッションID先頭8桁) にする."
+  "Start a new claude chat buffer and process.
+If RESUME-ID is non-nil, resumes with `--resume RESUME-ID'.
+If HISTORY-FILE is non-nil, replays that session's past log at the top of
+the buffer.
+SUMMARY is a content-based label for naming, such as the session's first
+message.
+The process's current directory is the caller's `default-directory'.
+The buffer name is *claude:folder-name* when new, or
+*claude:folder-name:content-label* when resuming (falling back to the
+first 8 characters of the session ID if no label is available)."
   (let* ((dir default-directory)
          (base (if resume-id
                    (format "%s:%s" (claude-buffer--dir-label dir)
@@ -394,15 +415,16 @@ SUMMARY はそのセッションの最初の発言など、名前に使う内容
 
 ;;;###autoload
 (defun claude-buffer ()
-  "新しいclaudeチャットバッファとプロセスを開始する(カレントディレクトリのまま)."
+  "Start a new claude chat buffer and process (staying in the current
+directory)."
   (interactive)
   (claude-buffer--start))
 
 (defun claude-buffer--search-git-root (dir)
-  "DIR から上へ辿って `.git' があるディレクトリを探して返す(なければnil).
-DIR が `~' 配下にある場合、探索は `~' までに限り、それより上の祖先
-ディレクトリは見ない(無関係な親ディレクトリのgitリポジトリを誤検出
-しないため)."
+  "Walk up from DIR looking for a directory containing `.git' and return
+it (nil if none). When DIR is under `~', the search is bounded by `~'
+and doesn't look at ancestor directories above it, to avoid mistakenly
+picking up an unrelated parent directory's git repository."
   (let* ((home (file-name-as-directory (expand-file-name "~")))
          (cur (file-name-as-directory (expand-file-name dir)))
          (bounded (string-prefix-p home cur)))
@@ -418,10 +440,9 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
           (setq cur parent))))))
 
 (defun claude-buffer--project-root ()
-  ".repo ディレクトリがあればそこを、なければ `~' までの範囲でgitルートを、
-それでもなければ project.el が分かるプロジェクトルートを、
-どれもなければ default-directory を返す
-(claude-custom-project-root と同じ考え方)."
+  "Return the `.repo' directory if one exists; otherwise the git root
+within `~'; otherwise whatever project root project.el can find;
+otherwise default-directory (same idea as claude-custom-project-root)."
   (let ((repo-root (locate-dominating-file default-directory ".repo")))
     (cond
      (repo-root repo-root)
@@ -431,28 +452,28 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
 
 ;;;###autoload
 (defun claude-buffer-new ()
-  "フォルダに依存しない、その場限りの新規チャットを開始する.
-確認なしで ~/claude-chats/misc を使う."
+  "Start a folder-independent, throwaway new chat.
+Uses ~/claude-chats/misc without asking."
   (interactive)
   (let ((default-directory (expand-file-name "misc" "~/claude-chats")))
     (claude-buffer--start)))
 
 ;;;###autoload
 (defun claude-buffer-new-here ()
-  "カレントフォルダが属するプロジェクトルートで新規チャットを開始する."
+  "Start a new chat rooted at the project the current folder belongs to."
   (interactive)
   (let ((default-directory (claude-buffer--project-root)))
     (claude-buffer--start)))
 
 (defvar claude-buffer-projects-dir "~/.claude/projects/"
-  "Claude Codeのセッション(JSONL)が保存されているディレクトリ.")
+  "Directory where Claude Code stores session JSONL files.")
 
 (defun claude-buffer--encode-dir (dir)
-  "DIR (絶対パス)をClaude Codeのプロジェクトディレクトリ名に変換する."
+  "Convert DIR (an absolute path) to Claude Code's project directory name."
   (replace-regexp-in-string "/" "-" (directory-file-name (expand-file-name dir))))
 
 (defun claude-buffer--all-session-files ()
-  "全プロジェクトのセッションファイル(.jsonl)を新しい順で返す."
+  "Return every project's session files (.jsonl), newest first."
   (let ((root (expand-file-name claude-buffer-projects-dir)))
     (sort
      (cl-loop for dir in (and (file-directory-p root)
@@ -462,19 +483,20 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
      #'file-newer-than-file-p)))
 
 (defun claude-buffer--session-files-here ()
-  "カレントプロジェクトのセッションファイル(.jsonl)だけを新しい順で返す."
+  "Return only the current project's session files (.jsonl), newest first."
   (let ((dir (expand-file-name (claude-buffer--encode-dir (claude-buffer--project-root))
                                 claude-buffer-projects-dir)))
     (sort (and (file-directory-p dir) (directory-files dir t "\\.jsonl\\'"))
           #'file-newer-than-file-p)))
 
 (defun claude-buffer--session-title (file)
-  "FILE (セッションjsonl)全体から `ai-title' レコード
-(claude本体やclaude-buffer-rename-sessionが書き込むもの)を探し、
-一番最後に見つかったものを返す(なければnil).
-末尾の一部だけを見る実装だと、renameした後も会話が続いて追記され続ける
-うちに古いレコードになってしまう(会話中のセッションで実際に起きた)ため、
-ファイル全体を対象にする(claude-buffer--render-historyと同じ考え方)."
+  "Search all of FILE (a session jsonl) for `ai-title' records (written
+by claude itself, or by claude-buffer-rename-session) and return the
+last one found (nil if none).
+Scanning only a tail window would go stale once the conversation keeps
+appending after a rename (this actually happened on a live session), so
+the whole file is scanned instead (same idea as
+claude-buffer--render-history)."
   (condition-case nil
       (with-temp-buffer
         (insert-file-contents file)
@@ -495,10 +517,11 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
     (error nil)))
 
 (defun claude-buffer--session-info (file)
-  "FILE (セッションjsonl)から (cwd . preview) を取り出す. 失敗時は(nil . nil).
-preview は末尾に ai-title レコード(claude-buffer-rename-sessionで
-付けたものを含む)があればそれを優先し、なければ先頭のuserメッセージ
-から作る."
+  "Extract (cwd . preview) from FILE (a session jsonl). Returns
+(nil . nil) on failure.
+preview prefers an ai-title record (including one set by
+claude-buffer-rename-session) if present, otherwise it's built from the
+first user message."
   (condition-case nil
       (with-temp-buffer
         (insert-file-contents file nil 0 4096)
@@ -524,8 +547,8 @@ preview は末尾に ai-title レコード(claude-buffer-rename-sessionで
     (error (cons nil nil))))
 
 (defun claude-buffer--session-candidates (files)
-  "FILES から completing-read 用の候補alistを作る.
-値は (id cwd file preview) のリスト."
+  "Build a completing-read candidate alist from FILES.
+Values are lists of (id cwd file preview)."
   (cl-loop for file in files
            for id = (file-name-base file)
            for info = (claude-buffer--session-info file)
@@ -540,11 +563,11 @@ preview は末尾に ai-title レコード(claude-buffer-rename-sessionで
                          (list id cwd file preview))))
 
 (defun claude-buffer--completion-table (candidates)
-  "CANDIDATES (alist)を、並び順を保ったまま使えるcompletion tableにする.
-completing-readの既定UIはラベルをアルファベット順に並べ替えてしまい、
-ラベル先頭の日付文字列のせいで古い順になってしまうため、
-display-sort-function/cycle-sort-function を identity にして
-CANDIDATES(新しい順)の並びをそのまま使わせる."
+  "Turn CANDIDATES (an alist) into a completion table that preserves
+order. completing-read's default UI alphabetizes labels, which sorts
+oldest-first because of the date string at the start of each label, so
+display-sort-function/cycle-sort-function are set to identity to keep
+CANDIDATES' (newest-first) order as-is."
   (lambda (string pred action)
     (if (eq action 'metadata)
         '(metadata (display-sort-function . identity)
@@ -552,11 +575,13 @@ CANDIDATES(新しい順)の並びをそのまま使わせる."
       (complete-with-action action candidates string pred))))
 
 (defun claude-buffer--read-session (files prompt)
-  "FILES から completing-read でセッションを選ばせ、(id cwd file preview) を返す.
-デフォルトは一番新しいセッションで、候補一覧も新しい順に並ぶ."
+  "Let the user pick a session from FILES via completing-read and return
+(id cwd file preview).
+The default is the most recent session, and the candidate list is also
+ordered newest-first."
   (let ((candidates (claude-buffer--session-candidates files)))
     (if (null candidates)
-        (user-error "claude-buffer: セッションが見つかりません")
+        (user-error "claude-buffer: no sessions found")
       (let* ((default (caar candidates))
              (choice (completing-read (format "%s (default %s): " prompt default)
                                        (claude-buffer--completion-table candidates)
@@ -564,8 +589,8 @@ CANDIDATES(新しい順)の並びをそのまま使わせる."
         (cdr (assoc choice candidates))))))
 
 (defun claude-buffer--render-history (file)
-  "FILE (セッションjsonl)から、userとclaudeのテキストだけを
-user>/claude> プロンプト付きの文字列として再構成する."
+  "Reconstruct just the user and claude text from FILE (a session jsonl)
+as a string with user>/claude> prompts."
   (let (parts)
     (with-temp-buffer
       (insert-file-contents file)
@@ -595,9 +620,10 @@ user>/claude> プロンプト付きの文字列として再構成する."
     (mapconcat #'identity (nreverse parts) claude-buffer--separator)))
 
 (defun claude-buffer--find-live-buffer-for-session (session-id)
-  "SESSION-ID に接続したままの claude-buffer-mode バッファを探す(なければnil).
-resumeしようとしたセッションに既にプロセスがぶら下がっている場合、
-同じセッションファイルへ二重に書き込んで壊さないようにするため使う."
+  "Find a claude-buffer-mode buffer still connected to SESSION-ID (nil if
+none). Used when resuming to avoid corrupting the session file by
+writing to it twice, in case a process is already attached to the
+session being resumed."
   (cl-find-if
    (lambda (buf)
      (with-current-buffer buf
@@ -607,56 +633,59 @@ resumeしようとしたセッションに既にプロセスがぶら下がっ�
    (buffer-list)))
 
 (defun claude-buffer--resume-session (files)
-  "FILES の中からセッションを選ばせ、--resume で再開するバッファを作る.
-選んだセッションに既に生きているバッファがあれば、新規に開かず
-そのバッファへ切り替えるだけにする(二重接続を防ぐため)."
+  "Let the user pick a session from FILES and create a buffer that
+resumes it with --resume. If a live buffer already exists for the
+chosen session, just switch to it instead of opening a new one (to
+avoid a double connection)."
   (pcase-let ((`(,id ,cwd ,file ,preview) (claude-buffer--read-session files "Session")))
     (let ((live (claude-buffer--find-live-buffer-for-session id)))
       (if live
           (progn
-            (message "claude-buffer: 既に開いているバッファに切り替えます")
+            (message "claude-buffer: switching to the already-open buffer")
             (switch-to-buffer live))
         (let ((default-directory (if cwd (expand-file-name cwd) default-directory)))
           (claude-buffer--start id file preview))))))
 
 ;;;###autoload
 (defun claude-buffer-resume ()
-  "全プロジェクト横断で、セッション一覧から選んで再開する."
+  "Pick a session to resume from the list across all projects."
   (interactive)
   (claude-buffer--resume-session (claude-buffer--all-session-files)))
 
 ;;;###autoload
 (defun claude-buffer-resume-here ()
-  "カレントプロジェクトのセッションだけを対象に、選んで再開する."
+  "Pick a session to resume, limited to the current project."
   (interactive)
   (claude-buffer--resume-session (claude-buffer--session-files-here)))
 
 (defun claude-buffer--remove-session (files)
-  "FILES の中からセッションを選ばせ、そのjsonlファイルを削除する.
-生きているバッファ(プロセス)がまだ繋がっているセッションは削除できない."
+  "Let the user pick a session from FILES and delete its jsonl file.
+A session that still has a live buffer (process) attached can't be
+deleted."
   (pcase-let ((`(,id ,cwd ,file ,_preview) (claude-buffer--read-session files "Remove session")))
     (when (claude-buffer--find-live-buffer-for-session id)
-      (user-error "claude-buffer: このセッションはまだ開いています。先にバッファを閉じてください"))
+      (user-error "claude-buffer: this session is still open; close its buffer first"))
     (when (yes-or-no-p (format "Delete session %s [%s]? " id (or cwd "?")))
       (delete-file file)
-      (message "claude-buffer: セッションを削除しました: %s" id))))
+      (message "claude-buffer: removed session: %s" id))))
 
 ;;;###autoload
 (defun claude-buffer-remove-session ()
-  "全プロジェクト横断で、セッション一覧から選んで削除する.
-生きているバッファ(プロセス)がまだ繋がっているセッションは削除できない."
+  "Pick a session to delete from the list across all projects.
+A session that still has a live buffer (process) attached can't be
+deleted."
   (interactive)
   (claude-buffer--remove-session (claude-buffer--all-session-files)))
 
 ;;;###autoload
 (defun claude-buffer-remove-session-here ()
-  "カレントプロジェクトのセッションだけを対象に、選んで削除する."
+  "Pick a session to delete, limited to the current project."
   (interactive)
   (claude-buffer--remove-session (claude-buffer--session-files-here)))
 
 (defun claude-buffer--rename-live-buffer (session-id title)
-  "SESSION-ID に接続したまま生きているバッファがあれば、
-TITLE を使ってそのバッファ名も付け直す(なければ何もしない)."
+  "If a buffer is still live and connected to SESSION-ID, rename it too
+using TITLE (does nothing if there is none)."
   (let ((buf (claude-buffer--find-live-buffer-for-session session-id)))
     (when buf
       (with-current-buffer buf
@@ -667,15 +696,15 @@ TITLE を使ってそのバッファ名も付け直す(なければ何もしな�
          t)))))
 
 (defun claude-buffer--rename-session-file (file)
-  "FILE (セッションjsonl)に、ミニバッファで入力させた新しい名前を
-`ai-title' レコードとして追記する(claude本体が書き込む形式と同じ).
-既存の内容は一切変更・削除しない. このセッションに生きているバッファが
-あれば、そのバッファ名も付け直す."
+  "Append a new name, entered in the minibuffer, to FILE (a session
+jsonl) as an `ai-title' record (the same format claude itself writes).
+Never modifies or deletes existing content. If this session has a live
+buffer, its name is updated to match too."
   (let* ((session-id (file-name-base file))
          (current (claude-buffer--session-title file))
          (title (string-trim (read-string "New name: " current))))
     (when (string-empty-p title)
-      (user-error "claude-buffer: 名前が空です"))
+      (user-error "claude-buffer: name is empty"))
     (with-temp-buffer
       (insert (json-encode `((type . "ai-title")
                               (aiTitle . ,title)
@@ -686,22 +715,23 @@ TITLE を使ってそのバッファ名も付け直す(なければ何もしな�
     title))
 
 (defun claude-buffer--rename-session (files)
-  "FILES の中からセッションを選ばせ、名前を付け直す."
+  "Let the user pick a session from FILES and rename it."
   (pcase-let ((`(,_id ,_cwd ,file ,_preview) (claude-buffer--read-session files "Rename session")))
     (let ((title (claude-buffer--rename-session-file file)))
-      (message "claude-buffer: 名前を変更しました: %s" title))))
+      (message "claude-buffer: renamed session: %s" title))))
 
 ;;;###autoload
 (defun claude-buffer-rename-session ()
-  "全プロジェクト横断で、セッション一覧から選んで名前を付け直す.
-session jsonl の末尾に `ai-title' レコードを追記するだけで、
-既存の内容は一切変更・削除しない(claude本体と同じ仕組みに乗る)."
+  "Pick a session to rename from the list across all projects.
+Just appends an `ai-title' record to the end of the session jsonl and
+never modifies or deletes existing content (uses the same mechanism as
+claude itself)."
   (interactive)
   (claude-buffer--rename-session (claude-buffer--all-session-files)))
 
 ;;;###autoload
 (defun claude-buffer-rename-session-here ()
-  "カレントプロジェクトのセッションだけを対象に、選んで名前を付け直す."
+  "Pick a session to rename, limited to the current project."
   (interactive)
   (claude-buffer--rename-session (claude-buffer--session-files-here)))
 
