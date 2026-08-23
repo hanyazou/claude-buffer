@@ -75,6 +75,10 @@ system/init イベント(あるいは他のどのイベントにも載ってい�
 (defvar-local claude-buffer--awaiting-first-text nil
   "非nilなら、次のテキストが来たらThinking...を置き換える.")
 
+(defvar-local claude-buffer--pending-tool-output nil
+  "非nilなら、直前の出力がtool_use/tool_resultだったことを示す.
+次にテキストブロックが来た時、区切りとして\"claude> \"を先に出すために使う.")
+
 (defvar-local claude-buffer--pending-output ""
   "JSONLの行区切りが来るまでの断片を溜めておくバッファ.")
 
@@ -153,7 +157,7 @@ claude-buffer--sanitize-label とは違い、改行を空白に置換しない).
       s)))
 
 (defun claude-buffer--tool-use-summary (block)
-  "BLOCK (assistantのtool_useブロック)から「→ ツール名: 詳細」の行を作る.
+  "BLOCK (assistantのtool_useブロック)から「ツール名: 詳細」の行を作る.
 詳細は command/file_path/pattern/url/query/prompt のうち最初に見つかったもの."
   (let* ((name (or (alist-get 'name block) "?"))
          (input (alist-get 'input block))
@@ -164,7 +168,7 @@ claude-buffer--sanitize-label とは違い、改行を空白に置換しない).
                      (alist-get 'query input)
                      (alist-get 'prompt input)
                      (and input (format "%S" input)))))
-    (format "→ %s: %s\n"
+    (format "%s: %s\n"
             name
             (claude-buffer--truncate-detail (or detail "") claude-buffer--tool-detail-maxlen))))
 
@@ -181,17 +185,17 @@ content は文字列の場合と、textブロックの配列の場合がある."
 (defun claude-buffer--tool-result-summary (block)
   "BLOCK (tool_resultブロック)の結果を、末尾
 claude-buffer--tool-result-max-lines 行だけ整形して返す.
-is_errorがtなら✗、それ以外は←を各行の頭に付ける."
+is_errorがtなら行頭に✗を付け、それ以外は半角スペース4つのインデントにする."
   (let* ((is-error (eq (alist-get 'is_error block) t))
          (text (string-trim (claude-buffer--tool-result-text block)))
          (lines (unless (string-empty-p text) (split-string text "\n")))
          (total (length lines))
          (tail (last lines claude-buffer--tool-result-max-lines))
-         (mark (if is-error "✗" "←")))
+         (prefix (if is-error "✗ " "    ")))
     (concat
      (when (> total claude-buffer--tool-result-max-lines)
-       (format "%s (%d行省略)\n" mark (- total claude-buffer--tool-result-max-lines)))
-     (mapconcat (lambda (l) (format "%s %s\n" mark l)) tail ""))))
+       (format "%s(%d行省略)\n" prefix (- total claude-buffer--tool-result-max-lines)))
+     (mapconcat (lambda (l) (format "%s%s\n" prefix l)) tail ""))))
 
 (defun claude-buffer--result-summary (data)
   "DATA (resultイベント)から所要時間・コスト・ターン数の1行サマリーを作る."
@@ -201,6 +205,21 @@ is_errorがtなら✗、それ以外は←を各行の頭に付ける."
         (err (eq (alist-get 'is_error data) t)))
     (format "[%s: %.1f秒 / $%.4f / %dターン]\n"
             (if err "エラー" "完了") seconds cost turns)))
+
+(defun claude-buffer--append-text (text)
+  "TEXT (assistantのtextブロック)をバッファに追加する.
+直前の出力がtool_use/tool_resultだった場合は、区切りとして
+先に\"claude> \"を出す(ツールの実行ログと本文を視覚的に分けるため)."
+  (when claude-buffer--pending-tool-output
+    (claude-buffer--append-output (concat "\n" (propertize "claude> " 'face 'bold)))
+    (setq claude-buffer--pending-tool-output nil))
+  (claude-buffer--append-output text))
+
+(defun claude-buffer--append-tool-output (text)
+  "TEXT (tool_use/tool_resultの要約)をバッファに追加し、
+直後にtextブロックが来た時に区切りを出せるようフラグを立てる."
+  (claude-buffer--append-output text)
+  (setq claude-buffer--pending-tool-output t))
 
 (defun claude-buffer--handle-json-line (line)
   "LINE (JSONL一行)をパースして、表示すべき部分をバッファに追加する.
@@ -220,13 +239,13 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
              ((equal (alist-get 'type block) "text")
               (let ((text (alist-get 'text block)))
                 (when (and text (> (length text) 0))
-                  (claude-buffer--append-output text))))
+                  (claude-buffer--append-text text))))
              ((equal (alist-get 'type block) "tool_use")
-              (claude-buffer--append-output (claude-buffer--tool-use-summary block))))))
+              (claude-buffer--append-tool-output (claude-buffer--tool-use-summary block))))))
          ((equal type "user")
           (dolist (block (alist-get 'content (alist-get 'message data)))
             (when (equal (alist-get 'type block) "tool_result")
-              (claude-buffer--append-output (claude-buffer--tool-result-summary block)))))
+              (claude-buffer--append-tool-output (claude-buffer--tool-result-summary block)))))
          ((and (equal type "system") (equal (alist-get 'subtype data) "permission_denied"))
           (claude-buffer--append-output
            (format "[権限拒否: %s — %s]\n"
@@ -284,6 +303,7 @@ C-c C-c にキーバインドするだけの関数なのでM-xには出さない
       (insert (propertize "user> " 'face 'bold))
       (setq claude-buffer--input-marker (point-marker))
       (setq claude-buffer--awaiting-first-text t)
+      (setq claude-buffer--pending-tool-output nil)
       (claude-buffer--start-turn-timer)
       (goto-char (point-max))
       (process-send-string
