@@ -17,6 +17,10 @@
 ;;   claude-buffer-new-here : カレントのプロジェクトルートで新規チャット
 ;;   claude-buffer-resume   : 全プロジェクト横断でセッション一覧から選んで再開
 ;;   claude-buffer-resume-here : カレントプロジェクトのセッションから選んで再開
+;;   claude-buffer-remove-session      : 全プロジェクト横断でセッションを選んで削除
+;;   claude-buffer-remove-session-here : カレントプロジェクトのセッションから選んで削除
+;;   claude-buffer-rename-session      : 全プロジェクト横断でセッションを選んで改名
+;;   claude-buffer-rename-session-here : カレントプロジェクトのセッションから選んで改名
 ;;   claude-buffer          : カレントディレクトリのまま新規チャット(素の版)
 ;;
 ;; resume系は completing-read を使うので、RETで直近セッションを再開、
@@ -444,8 +448,37 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
     (sort (and (file-directory-p dir) (directory-files dir t "\\.jsonl\\'"))
           #'file-newer-than-file-p)))
 
+(defun claude-buffer--session-title (file)
+  "FILE (セッションjsonl)全体から `ai-title' レコード
+(claude本体やclaude-buffer-rename-sessionが書き込むもの)を探し、
+一番最後に見つかったものを返す(なければnil).
+末尾の一部だけを見る実装だと、renameした後も会話が続いて追記され続ける
+うちに古いレコードになってしまう(会話中のセッションで実際に起きた)ため、
+ファイル全体を対象にする(claude-buffer--render-historyと同じ考え方)."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents file)
+        (let ((json-object-type 'alist) (json-array-type 'list)
+              (title nil))
+          (goto-char (point-min))
+          (while (not (eobp))
+            (let ((line (buffer-substring-no-properties
+                         (line-beginning-position) (line-end-position))))
+              (when (> (length line) 0)
+                (condition-case nil
+                    (let ((data (json-read-from-string line)))
+                      (when (equal (alist-get 'type data) "ai-title")
+                        (setq title (alist-get 'aiTitle data))))
+                  (error nil))))
+            (forward-line 1))
+          title))
+    (error nil)))
+
 (defun claude-buffer--session-info (file)
-  "FILE (セッションjsonl)の先頭から (cwd . preview) を取り出す. 失敗時は(nil . nil)."
+  "FILE (セッションjsonl)から (cwd . preview) を取り出す. 失敗時は(nil . nil).
+preview は末尾に ai-title レコード(claude-buffer-rename-sessionで
+付けたものを含む)があればそれを優先し、なければ先頭のuserメッセージ
+から作る."
   (condition-case nil
       (with-temp-buffer
         (insert-file-contents file nil 0 4096)
@@ -467,7 +500,7 @@ DIR が `~' 配下にある場合、探索は `~' までに限り、それより
                             (setq preview (substring content 0 (min 40 (length content))))))))
                   (error nil))))
             (forward-line 1))
-          (cons cwd preview)))
+          (cons cwd (or (claude-buffer--session-title file) preview))))
     (error (cons nil nil))))
 
 (defun claude-buffer--session-candidates (files)
@@ -577,6 +610,80 @@ resumeしようとしたセッションに既にプロセスがぶら下がっ�
   "カレントプロジェクトのセッションだけを対象に、選んで再開する."
   (interactive)
   (claude-buffer--resume-session (claude-buffer--session-files-here)))
+
+(defun claude-buffer--remove-session (files)
+  "FILES の中からセッションを選ばせ、そのjsonlファイルを削除する.
+生きているバッファ(プロセス)がまだ繋がっているセッションは削除できない."
+  (pcase-let ((`(,id ,cwd ,file ,_preview) (claude-buffer--read-session files "Remove session")))
+    (when (claude-buffer--find-live-buffer-for-session id)
+      (user-error "claude-buffer: このセッションはまだ開いています。先にバッファを閉じてください"))
+    (when (yes-or-no-p (format "Delete session %s [%s]? " id (or cwd "?")))
+      (delete-file file)
+      (message "claude-buffer: セッションを削除しました: %s" id))))
+
+;;;###autoload
+(defun claude-buffer-remove-session ()
+  "全プロジェクト横断で、セッション一覧から選んで削除する.
+生きているバッファ(プロセス)がまだ繋がっているセッションは削除できない."
+  (interactive)
+  (claude-buffer--remove-session (claude-buffer--all-session-files)))
+
+;;;###autoload
+(defun claude-buffer-remove-session-here ()
+  "カレントプロジェクトのセッションだけを対象に、選んで削除する."
+  (interactive)
+  (claude-buffer--remove-session (claude-buffer--session-files-here)))
+
+(defun claude-buffer--rename-live-buffer (session-id title)
+  "SESSION-ID に接続したまま生きているバッファがあれば、
+TITLE を使ってそのバッファ名も付け直す(なければ何もしない)."
+  (let ((buf (claude-buffer--find-live-buffer-for-session session-id)))
+    (when buf
+      (with-current-buffer buf
+        (rename-buffer
+         (format "*claude:%s:%s*"
+                 (claude-buffer--dir-label default-directory)
+                 (claude-buffer--sanitize-label title 20))
+         t)))))
+
+(defun claude-buffer--rename-session-file (file)
+  "FILE (セッションjsonl)に、ミニバッファで入力させた新しい名前を
+`ai-title' レコードとして追記する(claude本体が書き込む形式と同じ).
+既存の内容は一切変更・削除しない. このセッションに生きているバッファが
+あれば、そのバッファ名も付け直す."
+  (let* ((session-id (file-name-base file))
+         (current (claude-buffer--session-title file))
+         (title (string-trim (read-string "New name: " current))))
+    (when (string-empty-p title)
+      (user-error "claude-buffer: 名前が空です"))
+    (with-temp-buffer
+      (insert (json-encode `((type . "ai-title")
+                              (aiTitle . ,title)
+                              (sessionId . ,session-id)))
+              "\n")
+      (write-region (point-min) (point-max) file t))
+    (claude-buffer--rename-live-buffer session-id title)
+    title))
+
+(defun claude-buffer--rename-session (files)
+  "FILES の中からセッションを選ばせ、名前を付け直す."
+  (pcase-let ((`(,_id ,_cwd ,file ,_preview) (claude-buffer--read-session files "Rename session")))
+    (let ((title (claude-buffer--rename-session-file file)))
+      (message "claude-buffer: 名前を変更しました: %s" title))))
+
+;;;###autoload
+(defun claude-buffer-rename-session ()
+  "全プロジェクト横断で、セッション一覧から選んで名前を付け直す.
+session jsonl の末尾に `ai-title' レコードを追記するだけで、
+既存の内容は一切変更・削除しない(claude本体と同じ仕組みに乗る)."
+  (interactive)
+  (claude-buffer--rename-session (claude-buffer--all-session-files)))
+
+;;;###autoload
+(defun claude-buffer-rename-session-here ()
+  "カレントプロジェクトのセッションだけを対象に、選んで名前を付け直す."
+  (interactive)
+  (claude-buffer--rename-session (claude-buffer--session-files-here)))
 
 (provide 'claude-buffer)
 ;;; claude-buffer.el ends here
