@@ -24,9 +24,13 @@
 ;; バッファ先頭に再現する。
 ;;
 ;; キー操作:
-;;   RET      : マーカー以降(入力中のテキスト)をまとめて送信
-;;              (ポイントがマーカーより前=履歴閲覧中なら、ただの改行)
-;;   C-j / S-RET : 送信せずに改行(複数行の入力を組み立てる用)
+;;   C-c C-c  : マーカー以降(入力中のテキスト)をまとめて送信
+;;   RET      : 改行(複数行の入力を組み立てる用。C-j / S-RET も同様)
+;;
+;; Shift+EnterとEnterを打ち分けて送信/改行を切り替える設計は採用していない。
+;; Apple Terminal.appやTera Termをはじめ多くのターミナルエミュレータは
+;; Shift+Enterを素のEnterと区別して送ってこないため(GUI Emacsや一部の
+;; 対応端末を除く)、環境によらず確実に効くC-c C-cを送信キーにしている。
 ;;
 ;; 権限は試作用に固定: /tmp相当のファイル作成・変更、bash実行(コンパイル・
 ;; 実行含む)、Web検索を allowedTools で許可し、それ以外は都度は聞かず
@@ -261,43 +265,41 @@ assistantのtext/tool_use、userのtool_result、権限拒否、結果サマリ�
 (defun claude-buffer--send ()
   "マーカー以降を1メッセージとしてclaudeへ送信し、
 claude> Thinking... と次の user> プロンプトを表示する.
-ポイントがマーカーより前(履歴閲覧中)なら、ただの改行として扱う.
-RETにキーバインドするだけの関数なのでM-xには出さない(interactive無し)."
-  (if (< (point) (marker-position claude-buffer--input-marker))
-      (newline)
-    (let ((text (string-trim
-                 (buffer-substring-no-properties
-                  claude-buffer--input-marker (point-max)))))
-      (if (string-empty-p text)
-          (message "claude-buffer: 送信する入力がありません")
-        (goto-char (point-max))
-        (insert claude-buffer--separator)
-        (insert (propertize "claude> " 'face 'bold))
-        (setq claude-buffer--claude-output-marker (point-marker))
-        (insert claude-buffer--thinking-text)
-        (insert claude-buffer--separator)
-        (insert (propertize "user> " 'face 'bold))
-        (setq claude-buffer--input-marker (point-marker))
-        (setq claude-buffer--awaiting-first-text t)
-        (claude-buffer--start-turn-timer)
-        (goto-char (point-max))
-        (process-send-string
-         claude-buffer--process
-         (concat (json-encode `((type . "user")
-                                 (message . ((role . "user")
-                                             (content . ,text)))))
-                 "\n"))))))
+C-c C-c にキーバインドするだけの関数なのでM-xには出さない(interactive無し)."
+  (let ((text (string-trim
+               (buffer-substring-no-properties
+                claude-buffer--input-marker (point-max)))))
+    (if (string-empty-p text)
+        (message "claude-buffer: 送信する入力がありません")
+      (goto-char (point-max))
+      (insert claude-buffer--separator)
+      (insert (propertize "claude> " 'face 'bold))
+      (setq claude-buffer--claude-output-marker (point-marker))
+      (insert claude-buffer--thinking-text)
+      (insert claude-buffer--separator)
+      (insert (propertize "user> " 'face 'bold))
+      (setq claude-buffer--input-marker (point-marker))
+      (setq claude-buffer--awaiting-first-text t)
+      (claude-buffer--start-turn-timer)
+      (goto-char (point-max))
+      (process-send-string
+       claude-buffer--process
+       (concat (json-encode `((type . "user")
+                               (message . ((role . "user")
+                                           (content . ,text)))))
+               "\n")))))
 
 (defvar claude-buffer-mode-map
   (let ((map (make-sparse-keymap)))
-    ;; claude-buffer--send/newline は名前付きのinteractiveコマンドにせず、
+    ;; claude-buffer--send は名前付きのinteractiveコマンドにせず、
     ;; ここで無名lambdaとしてバインドすることでM-x補完に出てこないようにする.
-    (define-key map (kbd "RET") (lambda () (interactive) (claude-buffer--send)))
-    (define-key map (kbd "C-j") (lambda () (interactive) (newline)))
-    (define-key map (kbd "S-RET") (lambda () (interactive) (newline)))
-    (define-key map (kbd "<S-return>") (lambda () (interactive) (newline)))
+    ;; RETは特にrebindしない(バッファ標準の改行のまま).
+    (define-key map (kbd "C-c C-c") (lambda () (interactive) (claude-buffer--send)))
     map)
-  "claude-buffer-mode 用のキーマップ.")
+  "claude-buffer-mode 用のキーマップ.
+送信は C-c C-c で行う. Shift+Enterでの送信/改行切り替えは、多くの
+ターミナルエミュレータがShift+Enterを素のEnterと区別できないため
+採用していない(詳細はファイル冒頭のCommentary参照).")
 
 (define-derived-mode claude-buffer-mode fundamental-mode "Claude"
   "claude -p --input-format/--output-format stream-json と会話する為の
@@ -372,12 +374,34 @@ SUMMARY はそのセッションの最初の発言など、名前に使う内容
   (interactive)
   (claude-buffer--start))
 
+(defun claude-buffer--search-git-root (dir)
+  "DIR から上へ辿って `.git' があるディレクトリを探して返す(なければnil).
+DIR が `~' 配下にある場合、探索は `~' までに限り、それより上の祖先
+ディレクトリは見ない(無関係な親ディレクトリのgitリポジトリを誤検出
+しないため)."
+  (let* ((home (file-name-as-directory (expand-file-name "~")))
+         (cur (file-name-as-directory (expand-file-name dir)))
+         (bounded (string-prefix-p home cur)))
+    (catch 'done
+      (while t
+        (when (file-exists-p (expand-file-name ".git" cur))
+          (throw 'done cur))
+        (when (and bounded (equal cur home))
+          (throw 'done nil))
+        (let ((parent (file-name-directory (directory-file-name cur))))
+          (when (equal parent cur)
+            (throw 'done nil))
+          (setq cur parent))))))
+
 (defun claude-buffer--project-root ()
-  ".repo ディレクトリがあればそこを、なければ git ルートを、
-どちらもなければ default-directory を返す (claude-custom-project-root と同じ考え方)."
+  ".repo ディレクトリがあればそこを、なければ `~' までの範囲でgitルートを、
+それでもなければ project.el が分かるプロジェクトルートを、
+どれもなければ default-directory を返す
+(claude-custom-project-root と同じ考え方)."
   (let ((repo-root (locate-dominating-file default-directory ".repo")))
     (cond
      (repo-root repo-root)
+     ((claude-buffer--search-git-root default-directory))
      ((project-current) (project-root (project-current)))
      (t default-directory))))
 
