@@ -521,28 +521,45 @@ claude-buffer--render-history)."
 (nil . nil) on failure.
 preview prefers an ai-title record (including one set by
 claude-buffer-rename-session) if present, otherwise it's built from the
-first user message."
+first user message.
+The first prompt is stored in full both in the queue-operation records
+and in the first user record (cwd comes near the end of that record),
+so a long prompt can push cwd well past any fixed size. Instead, FILE
+is read 4096 bytes at a time until the first user message is found,
+and only complete lines are parsed. Chunks are read as raw bytes and
+each line is decoded on its own, since a chunk boundary may split a
+UTF-8 character but never a newline."
   (condition-case nil
       (with-temp-buffer
-        (insert-file-contents file nil 0 4096)
+        (set-buffer-multibyte nil)
         (let ((json-object-type 'alist) (json-array-type 'list)
-              (cwd nil) (preview nil))
-          (goto-char (point-min))
-          (while (and (not preview) (not (eobp)))
-            (let ((line (buffer-substring-no-properties
-                         (line-beginning-position) (line-end-position))))
-              (when (> (length line) 0)
-                (condition-case nil
-                    (let* ((data (json-read-from-string line))
-                           (type (alist-get 'type data)))
-                      (unless cwd
-                        (setq cwd (alist-get 'cwd data)))
-                      (when (equal type "user")
-                        (let ((content (alist-get 'content (alist-get 'message data))))
-                          (when (stringp content)
-                            (setq preview (substring content 0 (min 40 (length content))))))))
-                  (error nil))))
-            (forward-line 1))
+              (size (file-attribute-size (file-attributes file)))
+              (offset 0) (cwd nil) (preview nil))
+          (while (and (not preview) (< offset size))
+            (goto-char (point-max))
+            (insert-file-contents-literally file nil offset (min size (+ offset 4096)))
+            (setq offset (+ offset 4096))
+            ;; Treat a final line without a trailing newline as complete too.
+            (when (and (>= offset size) (/= (char-before (point-max)) ?\n))
+              (goto-char (point-max))
+              (insert "\n"))
+            (goto-char (point-min))
+            (while (and (not preview) (search-forward "\n" nil t))
+              (let ((line (decode-coding-string
+                           (buffer-substring-no-properties (point-min) (1- (point)))
+                           'utf-8)))
+                (delete-region (point-min) (point))
+                (when (> (length line) 0)
+                  (condition-case nil
+                      (let* ((data (json-read-from-string line))
+                             (type (alist-get 'type data)))
+                        (unless cwd
+                          (setq cwd (alist-get 'cwd data)))
+                        (when (equal type "user")
+                          (let ((content (alist-get 'content (alist-get 'message data))))
+                            (when (stringp content)
+                              (setq preview (substring content 0 (min 40 (length content))))))))
+                    (error nil))))))
           (cons cwd (or (claude-buffer--session-title file) preview))))
     (error (cons nil nil))))
 
