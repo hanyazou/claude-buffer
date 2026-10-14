@@ -470,7 +470,7 @@ Uses ~/claude-chats/misc without asking."
 
 (defun claude-buffer--encode-dir (dir)
   "Convert DIR (an absolute path) to Claude Code's project directory name."
-  (replace-regexp-in-string "/" "-" (directory-file-name (expand-file-name dir))))
+  (replace-regexp-in-string "[^a-zA-Z0-9]" "-" (directory-file-name (expand-file-name dir))))
 
 (defun claude-buffer--all-session-files ()
   "Return every project's session files (.jsonl), newest first."
